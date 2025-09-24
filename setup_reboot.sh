@@ -1,28 +1,24 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-
 # Назначение:
 # Настройка узла цепочки прокси.
 # - Промежуточный узел (по умолчанию): Glider в Docker, форвард на конечный Shadowsocks.
 # - Конечный узел (--final): Shadowsocks-libev (snap) как конечная точка.
 
-# Использование:
-# setup_reboot.sh --forward-ip <IP> --password <PASS> [--final]
-# Примечание: --forward-ip обязателен для промежуточного узла; в режиме --final он не требуется.
-
 STATE_FILE="/root/.setup_state"
 SERVICE_NAME="proxy_setup_continue"
 SCRIPT_PATH="$(realpath "$0")"
+LOG_FILE="/var/log/proxy-setup.log"
 
-# Вывод шагов
 step() { printf "\n=== %s ===\n" "$*"; }
 ok()  { printf "Ок\n"; }
 die() { printf "Ошибка: %s\n" "$*" >&2; exit 1; }
 require_root() { [[ $EUID -eq 0 ]] || die "Запускать от root"; }
 
-# Сохранить состояние
 save_state() {
   install -d -m 700 "$(dirname "$STATE_FILE")"
+  install -d -m 755 "$(dirname "$LOG_FILE")" 2>/dev/null || true
+  touch "$LOG_FILE" || true
   cat > "$STATE_FILE" <<EOF
 FORWARD_IP=${FORWARD_IP:-}
 PASSWORD=${PASSWORD:-}
@@ -31,38 +27,60 @@ START_STEP=${1:-1}
 EOF
 }
 
-# systemd-юнит для возобновления
 create_resume_service() {
   cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
 Description=Resume proxy setup after reboot
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=oneshot
 ExecStart=/bin/bash -lc '${SCRIPT_PATH} --resume'
 RemainAfterExit=yes
-
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable "${SERVICE_NAME}"
+  systemctl daemon-reload >>"$LOG_FILE" 2>&1
+  systemctl enable --quiet "${SERVICE_NAME}" >>"$LOG_FILE" 2>&1
 }
 
 disable_resume_service() {
-  systemctl disable "${SERVICE_NAME}" || true
+  systemctl disable --quiet "${SERVICE_NAME}" >>"$LOG_FILE" 2>&1 || true
   rm -f "/etc/systemd/system/${SERVICE_NAME}.service" || true
-  systemctl daemon-reload
+  systemctl daemon-reload >>"$LOG_FILE" 2>&1
 }
 
-# Аргументы
-FORWARD_IP=""
-PASSWORD=""
-IS_FINAL=false
-RESUME=false
+apt_safe_update_upgrade() {
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 update >>"$LOG_FILE" 2>&1
+  if ! DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+       apt-get -o DPkg::Lock::Timeout=600 -y -o Dpkg::Options::="--force-confnew" upgrade >>"$LOG_FILE" 2>&1; then
+    systemctl stop unattended-upgrades >>"$LOG_FILE" 2>&1 || true
+    for i in $(seq 1 60); do
+      if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then break; fi
+      sleep 5
+    done
+    DEBIAN_FRONTEND=noninteractive apt-get -y update >>"$LOG_FILE" 2>&1
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+      apt-get -y -o Dpkg::Options::="--force-confnew" upgrade >>"$LOG_FILE" 2>&1
+    systemctl start unattended-upgrades >>"$LOG_FILE" 2>&1 || true
+  fi
+}
 
+apt_safe_install() {
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 update >>"$LOG_FILE" 2>&1 || true
+  if ! DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get -o DPkg::Lock::Timeout=600 -y install "$@" >>"$LOG_FILE" 2>&1; then
+    systemctl stop unattended-upgrades >>"$LOG_FILE" 2>&1 || true
+    for i in $(seq 1 60); do
+      if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then break; fi
+      sleep 5
+    done
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get -y install "$@" >>"$LOG_FILE" 2>&1
+    systemctl start unattended-upgrades >>"$LOG_FILE" 2>&1 || true
+  fi
+}
+
+# Параметры
+FORWARD_IP=""; PASSWORD=""; IS_FINAL=false; RESUME=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --forward-ip) FORWARD_IP="${2:?}"; shift 2;;
@@ -93,19 +111,15 @@ fi
 
 START_STEP="${START_STEP:-1}"
 
-# [1/8] Обновление системы (неинтерактивно, авто‑рестарт сервисов)
+# [1/8] Обновление системы
 if [[ "$START_STEP" -le 1 ]]; then
   step "[1/8] Обновление системы (авто-рестарт сервисов)"
-  # Подготовить needrestart к авто‑режиму на Ubuntu 20.04/22.04
   if [[ -f /etc/needrestart/needrestart.conf ]]; then
-    sed -i "s/^\s*\$nrconf{restart}.*/\$nrconf{restart} = 'a';/; t; \$ a \$nrconf{restart} = 'a';" /etc/needrestart/needrestart.conf || true
-    sed -i "s/^\s*\$nrconf{kernelhints}.*/\$nrconf{kernelhints} = 0;/" /etc/needrestart/needrestart.conf || true
+    sed -i "s/^\s*\$nrconf{restart}.*/\$nrconf{restart} = 'a';/; t; \$ a \$nrconf{restart} = 'a';" /etc/needrestart/needrestart.conf >>"$LOG_FILE" 2>&1 || true
+    sed -i "s/^\s*\$nrconf{kernelhints}.*/\$nrconf{kernelhints} = 0;/" /etc/needrestart/needrestart.conf >>"$LOG_FILE" 2>&1 || true
   fi
   retry=3
-  until \
-    DEBIAN_FRONTEND=noninteractive apt-get update && \
-    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get -y -o Dpkg::Options::="--force-confnew" upgrade
-  do
+  until apt_safe_update_upgrade; do
     ((retry--)); ((retry==0)) && die "apt upgrade не удалось"
     sleep 3
   done
@@ -116,8 +130,7 @@ fi
 # [2/8] Базовые инструменты
 if [[ "$START_STEP" -le 2 ]]; then
   step "[2/8] Установка базовых инструментов"
-  DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y \
-    ca-certificates curl gnupg lsb-release jq net-tools dnsutils iproute2 python3-pip
+  apt_safe_install ca-certificates curl gnupg lsb-release jq net-tools dnsutils iproute2 python3-pip
   ok
   save_state 3
 fi
@@ -126,26 +139,26 @@ fi
 if [[ "$START_STEP" -le 3 ]]; then
   step "[3/8] Установка Docker и Compose"
   install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg >>"$LOG_FILE" 2>&1
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
-  DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update
-  DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+  DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update >>"$LOG_FILE" 2>&1
+  DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin >>"$LOG_FILE" 2>&1
   ok
   save_state 4
 fi
 
-# [4/8] Настройка фаервола (открываем порты)
+# [4/8] Настройка фаервола
 if [[ "$START_STEP" -le 4 ]]; then
   step "[4/8] Настройка фаервола (открываем порты)"
   if command -v ufw >/dev/null 2>&1 && ufw status | grep -q Status; then
-    ufw allow 1080/tcp || true
-    ufw allow 8388/tcp || true
-    ufw allow 8388/udp || true
-    ufw reload || true
+    ufw allow 1080/tcp >>"$LOG_FILE" 2>&1 || true
+    ufw allow 8388/tcp >>"$LOG_FILE" 2>&1 || true
+    ufw allow 8388/udp >>"$LOG_FILE" 2>&1 || true
+    ufw reload >>"$LOG_FILE" 2>&1 || true
   fi
-  iptables -I INPUT -p tcp --dport 1080 -j ACCEPT || true
-  iptables -I INPUT -p tcp --dport 8388 -j ACCEPT || true
-  iptables -I INPUT -p udp --dport 8388 -j ACCEPT || true
+  iptables -I INPUT -p tcp --dport 1080 -j ACCEPT >>"$LOG_FILE" 2>&1 || true
+  iptables -I INPUT -p tcp --dport 8388 -j ACCEPT >>"$LOG_FILE" 2>&1 || true
+  iptables -I INPUT -p udp --dport 8388 -j ACCEPT >>"$LOG_FILE" 2>&1 || true
   ok
   save_state 5
 fi
@@ -161,8 +174,8 @@ services:
     container_name: glider-proxy
     restart: unless-stopped
     ports:
-      - "1080:1080"   # SOCKS5 (опционально: добавить listen)
-      - "8388:8388"   # Shadowsocks
+      - "1080:1080"
+      - "8388:8388"
     logging:
       driver: json-file
       options:
@@ -180,7 +193,7 @@ services:
       -dns 8.8.8.8:53
       -strategy rr
 EOF
-  docker compose -f /opt/glider/docker-compose.yml up -d
+  docker compose -f /opt/glider/docker-compose.yml up -d >>"$LOG_FILE" 2>&1
   ok
   save_state 6
 fi
@@ -188,8 +201,8 @@ fi
 # [6/8] Конечный узел (Shadowsocks-libev)
 if [[ "$IS_FINAL" == true && "$START_STEP" -le 6 ]]; then
   step "[6/8] Настройка конечного узла (Shadowsocks-libev)"
-  DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y snapd
-  snap install shadowsocks-libev
+  apt_safe_install snapd
+  snap install shadowsocks-libev >>"$LOG_FILE" 2>&1
   CONFIG_PATH="/var/snap/shadowsocks-libev/common/etc/shadowsocks-libev"
   install -d -m 755 "$CONFIG_PATH"
   cat > "$CONFIG_PATH/config.json" <<EOF
@@ -206,22 +219,21 @@ if [[ "$IS_FINAL" == true && "$START_STEP" -le 6 ]]; then
   "method": "aes-256-gcm"
 }
 EOF
-  cat > /etc/systemd/system/shadowsocks-libev-server@.service <<EOF
+  cat > /etc/systemd/system/shadowsocks-libev-server@.service <<'EOF'
 [Unit]
 Description=Shadowsocks-Libev Custom Server Service for %I
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=simple
-ExecStart=/usr/bin/snap run shadowsocks-libev.ss-server -c $CONFIG_PATH/%i.json
+Environment=CONFIG_PATH=/var/snap/shadowsocks-libev/common/etc/shadowsocks-libev
+ExecStart=/usr/bin/snap run shadowsocks-libev.ss-server -c ${CONFIG_PATH}/%i.json
 Restart=on-failure
-
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable --now shadowsocks-libev-server@config
+  systemctl daemon-reload >>"$LOG_FILE" 2>&1
+  systemctl enable --quiet --now shadowsocks-libev-server@config >>"$LOG_FILE" 2>&1
   ok
   save_state 7
 fi
@@ -230,10 +242,10 @@ fi
 if [[ "$START_STEP" -le 7 ]]; then
   step "[7/8] Проверка состояния сервисов"
   if [[ "$IS_FINAL" == true ]]; then
-    systemctl --no-pager status shadowsocks-libev-server@config || true
-    ss -lntup | grep -E ':8388' || true
+    systemctl --no-pager status shadowsocks-libev-server@config >>"$LOG_FILE" 2>&1 || true
+    ss -lntup | grep -E ':8388' >>"$LOG_FILE" 2>&1 || true
   else
-    docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' || true
+    docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' >>"$LOG_FILE" 2>&1 || true
   fi
   ok
   save_state 8
@@ -246,4 +258,16 @@ if [[ "$START_STEP" -le 8 ]]; then
   disable_resume_service
   ok
   printf "✅ Установка завершена\n"
+  printf "Логи: %s\n" "$LOG_FILE" >>"$LOG_FILE" 2>&1 || true
+
+  # Человекочитаемый финал + последовательный ребут (VM с root)
+  echo "Настройка завершена. Перезагружаем сервер." | tee -a /root/.proxysetup_ok
+
+  # 1) Мягкая перезагрузка (последовательно, без ухода в фон)
+  systemctl reboot || shutdown -r now || reboot -f || true
+
+  # 2) Если выполнение продолжилось — форс-ребут SysRq (выполняется синхронно)
+  sleep 10
+  echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
+  echo b > /proc/sysrq-trigger 2>/dev/null || true
 fi
